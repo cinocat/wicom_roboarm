@@ -165,3 +165,4 @@ Tạo service systemd chạy sau khi ROS master sẵn sàng, hoặc thêm vào l
 ---
 
 Với bộ mã và hướng dẫn trên, bạn có thể triển khai ngay trên Raspberry Pi 4 chạy Clover, kiểm thử an toàn bằng các demo có sẵn, và vận hành song song với các node ROS khác mà không phá vỡ functionality hiện có.# wicom_roboarm
+# wicom_roboarm
