@@ -6,7 +6,15 @@
         output="screen"
         respawn="true"
         launch-prefix="nice -n 10">
+
+    <param name="i2c_bus" value="1" />
+    <param name="i2c_address" value="0x40" />
+    <param name="use_mux" value="true" />
+    <param name="mux_address" value="0x70" />
+    <param name="mux_channel" value="2" />
+
     <rosparam file="$(find wicom_roboarm)/config/servos.yaml" command="load"/>
+
     <!-- Namespace everything to avoid topic collisions -->
     <remap from="joint_states" to="/pca9685_servo/joint_states"/>
     <remap from="set_angle"   to="/pca9685_servo/set_angle"/>

@@ -7,9 +7,39 @@ import rospy
 from sensor_msgs.msg import JointState
 from std_srvs.srv import Trigger, TriggerResponse
 from wicom_roboarm.srv import SetAngle, SetAngleResponse
-
-# Use smbus2 to directly control PCA9685 (no Blinka dependency, selectable bus)
 from smbus2 import SMBus
+
+# NHÚNG multiplexer
+class I2CMux:
+    def __init__(self, bus: SMBus, address=0x70, settle_time=0.001):
+        self.bus = bus
+        self.address = address
+        self.settle_time = settle_time
+        self._current = None
+    def select(self, channel: int, force=False):
+        if not (0 <= channel <= 7):
+            raise ValueError("Kênh multiplexer phải 0–7")
+        if self._current == channel and not force:
+            return
+        self.bus.write_byte(self.address, 1 << channel)
+        time.sleep(self.settle_time)
+        self._current = channel
+
+# HÀM DUY NHẤT THÊM MỚI: parse địa chỉ I2C (chấp nhận '0x40', '64', 64)
+def _parse_i2c_addr(raw, default):
+    if raw is None:
+        return default
+    if isinstance(raw, int):
+        return raw
+    if isinstance(raw, str):
+        raw = raw.strip()
+        try:
+            return int(raw, 0)     # base=0 cho phép '0x..'
+        except ValueError:
+            rospy.logwarn("Không parse được địa chỉ I2C từ '%s', dùng mặc định 0x%02X", raw, default)
+            return default
+    rospy.logwarn("Kiểu địa chỉ I2C không hỗ trợ (%s), dùng mặc định 0x%02X", type(raw), default)
+    return default
 
 # PCA9685 registers/constants
 MODE1      = 0x00
@@ -30,27 +60,37 @@ ALLCALL = 0x01
 OUTDRV  = 0x04
 
 class PCA9685:
-    def __init__(self, bus: int, address: int, oscillator_hz: int = 25000000):
-        self._busnum = bus
+    def __init__(self, bus_or_num, address: int, oscillator_hz: int = 25000000,
+                 mux: I2CMux = None, mux_channel: int = None):
+        if isinstance(bus_or_num, SMBus):
+            self._bus = bus_or_num
+            self._owns_bus = False
+        else:
+            self._bus = SMBus(int(bus_or_num))
+            self._owns_bus = True
         self._addr = address
         self._oscillator_hz = oscillator_hz
-        self._bus = SMBus(self._busnum)
+        self._mux = mux
+        self._mux_channel = mux_channel
         self._init_device()
 
+    def _select_mux(self):
+        if self._mux and self._mux_channel is not None:
+            self._mux.select(self._mux_channel)
+
     def _write8(self, reg, val):
+        self._select_mux()
         self._bus.write_byte_data(self._addr, reg, val & 0xFF)
 
     def _read8(self, reg):
+        self._select_mux()
         return self._bus.read_byte_data(self._addr, reg)
 
     def _init_device(self):
-        # Initialize device safely
-        # MODE2: totem pole (OUTDRV), MODE1: ALLCALL, wake from sleep
         self._write8(MODE2, OUTDRV)
         self._write8(MODE1, ALLCALL)
         time.sleep(0.005)
-        mode1 = self._read8(MODE1)
-        mode1 = mode1 & ~SLEEP  # wake up
+        mode1 = self._read8(MODE1) & ~SLEEP
         self._write8(MODE1, mode1)
         time.sleep(0.005)
 
@@ -73,7 +113,6 @@ class PCA9685:
         self._write8(base + 3, (off >> 8) & 0x0F)
 
     def set_off(self, channel: int):
-        # Full OFF bit on OFF_H (bit 4)
         base = LED0_ON_L + 4 * channel
         self._write8(base + 0, 0x00)
         self._write8(base + 1, 0x00)
@@ -87,17 +126,18 @@ class PCA9685:
         self._write8(ALL_LED_OFF_H, 0x10)
 
     def close(self):
-        try:
-            self._bus.close()
-        except Exception:
-            pass
+        if self._owns_bus:
+            try:
+                self._bus.close()
+            except:
+                pass
 
 
 class ServoControllerNode:
     def __init__(self):
-        # Load params
+        # --- PARSE PARAMS (chỉ chèn parse địa chỉ, còn lại giữ nguyên) ---
         self.busnum = rospy.get_param("~i2c_bus", 1)
-        self.address = int(rospy.get_param("~i2c_address", 0x40))
+        self.address = _parse_i2c_addr(rospy.get_param("~i2c_address", 0x40), 0x40)
         self.pwm_freq = float(rospy.get_param("~pwm_frequency_hz", 50.0))
         self.oscillator_hz = int(rospy.get_param("~oscillator_hz", 25000000))
         self.enable_on_start = bool(rospy.get_param("~enable_on_start", False))
@@ -115,11 +155,14 @@ class ServoControllerNode:
         self.timeout_behavior = rospy.get_param("~timeout_behavior", "hold")
         self.shutdown_behavior = rospy.get_param("~shutdown_behavior", "neutral")
 
+        self.use_mux = rospy.get_param("~use_mux", True)
+        self.mux_address = _parse_i2c_addr(rospy.get_param("~mux_address", 0x70), 0x70)
+        self.mux_channel = int(rospy.get_param("~mux_channel", 2))
+
         if not self.joint_names or not self.channels or len(self.joint_names) != len(self.channels):
             rospy.logfatal("joint_names and channels must be provided with equal length.")
             raise RuntimeError("Invalid joint mapping")
 
-        # State
         self.num_joints = len(self.joint_names)
         self.name_to_idx = {n: i for i, n in enumerate(self.joint_names)}
         self.channel_by_idx = {i: ch for i, ch in enumerate(self.channels)}
@@ -127,43 +170,40 @@ class ServoControllerNode:
         self.last_cmd_time = [rospy.get_time()] * self.num_joints
         self.enabled = self.enable_on_start
 
-        # Device
         try:
-            self.pca = PCA9685(self.busnum, self.address, self.oscillator_hz)
+            self._bus = SMBus(self.busnum)
+            self._mux = I2CMux(self._bus, self.mux_address) if self.use_mux else None
+            self.pca = PCA9685(self._bus, self.address, self.oscillator_hz,
+                               mux=self._mux, mux_channel=self.mux_channel)
             self.pca.set_pwm_freq(self.pwm_freq)
         except Exception as e:
             rospy.logfatal("Failed to initialize PCA9685 on /dev/i2c-%d addr 0x%02X: %s",
                            self.busnum, self.address, str(e))
             raise
 
-        # Apply neutral or off on start
         if self.enabled:
             self._apply_all(self.current_deg)
         else:
-            self._apply_behavior_all("off")  # outputs off until enabled
+            self._apply_behavior_all("off")
 
-        # ROS interfaces
         self.pub_joint = rospy.Publisher("joint_states", JointState, queue_size=10)
         self.srv_set_angle = rospy.Service("set_angle", SetAngle, self.handle_set_angle)
-
-        # Safety/utility services
         self.srv_enable = rospy.Service("enable", Trigger, self.handle_enable)
         self.srv_disable = rospy.Service("disable", Trigger, self.handle_disable)
         self.srv_home = rospy.Service("home", Trigger, self.handle_home)
-
-        # Optional: accept JointState command to set multiple joints at once
         self.sub_cmd = rospy.Subscriber("command", JointState, self.handle_joint_command, queue_size=10)
 
-        # Timers
         self.pub_timer = rospy.Timer(rospy.Duration(1.0 / max(self.publish_rate_hz, 1.0)), self._publish_status)
         self.watchdog_timer = rospy.Timer(rospy.Duration(0.05), self._watchdog_tick)
 
         rospy.on_shutdown(self._on_shutdown)
-        rospy.loginfo("PCA9685 Servo Controller started on /dev/i2c-%d addr 0x%02X, freq=%.1fHz, enabled=%s",
-                      self.busnum, self.address, self.pwm_freq, str(self.enabled))
+        rospy.loginfo("PCA9685 Servo Controller started /dev/i2c-%d addr=0x%02X mux=%s ch=%d freq=%.1fHz enabled=%s",
+                      self.busnum, self.address,
+                      ("0x%02X" % self.mux_address) if self.use_mux else "none",
+                      self.mux_channel if self.use_mux else -1,
+                      self.pwm_freq, self.enabled)
 
     def angle_to_count(self, angle_deg: float) -> int:
-        # Map angle [0..180] -> [pulse_us_min..pulse_us_max]
         span_us = self.pulse_us_max - self.pulse_us_min
         frac = max(0.0, min(1.0, angle_deg / 180.0))
         pulse_us = self.pulse_us_min + frac * span_us
@@ -181,7 +221,6 @@ class ServoControllerNode:
         except ValueError:
             return SetAngleResponse(False, f"Channel {req.channel} not managed by this node")
 
-        # Apply limits per joint
         name = self.joint_names[idx]
         lim = self.limits_deg.get(name, {"min": 0.0, "max": 180.0})
         target = max(lim.get("min", 0.0), min(lim.get("max", 180.0), float(req.angle_deg)))
@@ -206,7 +245,7 @@ class ServoControllerNode:
             for nm, pos in zip(msg.name, msg.position):
                 if nm in self.name_to_idx and pos is not None:
                     idx = self.name_to_idx[nm]
-                    deg = math.degrees(pos) if abs(pos) < 6.3 else float(pos)  # radians or degrees
+                    deg = math.degrees(pos) if abs(pos) < 6.3 else float(pos)
                     self._set_idx_with_limits(idx, deg, now)
                     changed = True
         elif not msg.name and msg.position:
@@ -216,7 +255,6 @@ class ServoControllerNode:
                 changed = True
         else:
             rospy.logwarn("JointState command ignored: names/positions mismatch")
-
         if changed and not self.enabled:
             rospy.logwarn("Enabling outputs due to JointState command")
             self.enabled = True
@@ -261,7 +299,7 @@ class ServoControllerNode:
         js = JointState()
         js.header.stamp = rospy.Time.now()
         js.name = list(self.joint_names)
-        js.position = [math.radians(d) for d in self.current_deg]  # ROS convention: radians
+        js.position = [math.radians(d) for d in self.current_deg]
         self.pub_joint.publish(js)
 
     def _watchdog_tick(self, _evt):
@@ -307,9 +345,12 @@ class ServoControllerNode:
             self._apply_behavior_all(self.shutdown_behavior)
             time.sleep(0.01)
             self.pca.close()
+            try:
+                self._bus.close()
+            except:
+                pass
         except Exception as e:
             rospy.logerr("Error during shutdown: %s", str(e))
-
 
 def main():
     rospy.init_node("wicom_roboarm_controller", anonymous=False)
@@ -318,7 +359,6 @@ def main():
         rospy.spin()
     except Exception as e:
         rospy.logfatal("Failed to start ServoControllerNode: %s", str(e))
-
 
 if __name__ == "__main__":
     main()

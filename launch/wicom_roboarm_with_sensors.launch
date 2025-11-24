@@ -1,0 +1,25 @@
+<launch>
+  <node pkg="wicom_roboarm"
+        type="wicom_roboarm_controller_node.py"
+        name="wicom_roboarm_controller"
+        output="screen">
+    <param name="i2c_bus" value="1" />
+    <param name="i2c_address" value="0x40" />
+    <param name="pwm_frequency_hz" value="50" />
+    <param name="use_mux" value="true" />
+    <param name="mux_address" value="0x70" />
+    <param name="mux_channel" value="2" />
+
+  </node>
+
+  <node pkg="wicom_roboarm"
+        type="vl53_dual_sensor_node.py"
+        name="vl53_dual_node"
+        output="screen">
+    <param name="i2c_bus" value="1" />
+    <param name="mux_address" value="0x70" />
+    <param name="channel_short" value="0" />
+    <param name="channel_long" value="1" />
+    <param name="publish_rate_hz" value="20" />
+  </node>
+</launch>

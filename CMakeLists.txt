@@ -25,6 +25,11 @@ catkin_package(
 
 catkin_install_python(PROGRAMS
   src/wicom_roboarm_controller_node.py
+  src/vl53_dual_sensor_node.py
   scripts/pca9685_kill_all.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
+)
+
+install(DIRECTORY launch config srv
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
